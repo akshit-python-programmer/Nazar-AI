@@ -1,0 +1,43 @@
+# NazarAI dependencies. Versions are the ones this was actually built and
+# tested against on Windows 11 / Python 3.13 / GTX 1650 Ti.
+#
+# PyTorch is NOT pinned here because the CUDA build has to come from the
+# PyTorch index, not PyPI. Install it first, then this file:
+#
+#   pip install torch==2.7.0 torchaudio==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu118
+#   pip install -r requirements.txt
+#
+# CPU-only machines can just `pip install torch torchaudio torchvision`;
+# everything degrades to CPU on its own.
+#
+# ffmpeg and ffprobe must also be on PATH. They are system binaries, not pip
+# packages. See the README.
+
+# web
+Flask==3.1.1
+
+# models
+transformers==4.46.3
+huggingface-hub==0.32.2
+safetensors==0.8.0
+tokenizers==0.20.3
+
+# media handling
+# ffmpeg and ffprobe are called directly through subprocess, so there is no
+# ffmpeg-python dependency. The binaries still have to be on PATH.
+opencv-contrib-python==4.10.0.84
+pillow==11.2.1
+numpy==2.2.5
+
+# provenance
+c2pa-python==0.37.8
+
+# reporting
+reportlab==5.0.1
+
+# whatsapp
+twilio==9.3.7
+requests==2.31.0
+
+# config
+python-dotenv==1.0.1

@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+
+# Model weights, roughly 1.2 GB. Downloaded on first run.
+models/
+
+# Everything the app generates at runtime.
+static/uploads/
+static/heatmaps/
+static/reports/
+static/ela/
+static/work/
+
+# Twilio credentials never belong in the repo.
+.env
+
+# Evaluation media pulled from Wikimedia for benchmarking.
+samples/eval_ai/
+samples/eval_real/
+samples/eval_audio/
