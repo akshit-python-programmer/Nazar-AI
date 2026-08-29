@@ -1,0 +1,3 @@
+A software application to identify Deepfakes and morphed/edited photos or videos, calling it NaZarAI
+
+In the multi media Industry due to the growing use of AI and more tools of editing, it is increasingly becoming more easy to  morph edit or create deepfakes. Using CNN and Ml pipelines, we can identify the common patterns and classify wrongful unauthorised, fake multi media clips for the safety of users and in some cases the entire nation. To combat this growing issues which will prevail for years to come, we developed a tool named NazarAI which helps users find out the truth of any multi media. The technical side will be based on python libraries like flask, tensorflow and PyTorch. It will be trained on open source datasets and can be accessed through a web app 
