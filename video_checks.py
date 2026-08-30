@@ -82,12 +82,15 @@ def crop_largest_face(bgr_frame):
     return bgr_frame[y0:y1, x0:x1], True
 
 
-def _score_frames(frames):
+def _score_frames(frames, job_id=None):
     """
     Run the classifier over every sampled frame.
 
     frames (list): [{"t": float, "path": str, "index": int}] from
         media_utils.extract_frames.
+    job_id (str|None): when given, frame counts are published to progress.py
+        after every batch. This is the slowest step of a video run, so it is
+        the one the page most needs to see moving.
 
     Returns (list): [{"t", "path", "score" (float|None), "has_face" (bool),
     "weight" (float)}] in time order. Frames the model could not score keep a
@@ -97,12 +100,22 @@ def _score_frames(frames):
     import cv2
     from PIL import Image
 
+    import progress
+
     scored = []
     batch_images = []
     batch_meta = []
+    total = len(frames)
+
+    if job_id:
+        # Publish 0/N up front. The first batch includes loading the model, so
+        # without this the counter would sit empty for several seconds.
+        progress.frames(job_id, 0, total)
+        progress.stage(job_id, "video_face_manipulation", "run", f"frame 0/{total}",
+                       "Loading the detector and scoring sampled frames…")
 
     def flush():
-        """Score whatever is queued and append the results."""
+        """Score whatever is queued, append results, and report the count."""
         if not batch_images:
             return
         results = image_checks.classify_images(batch_images)
@@ -111,6 +124,10 @@ def _score_frames(frames):
             scored.append(meta)
         batch_images.clear()
         batch_meta.clear()
+        if job_id:
+            progress.frames(job_id, len(scored), total)
+            progress.stage(job_id, "video_face_manipulation", "run",
+                           f"frame {len(scored)}/{total}")
 
     for frame in frames:
         bgr = cv2.imread(frame["path"])
@@ -188,16 +205,24 @@ def analyze_video_frames(media):
                                      "AI Face Manipulation (Video)",
                                      "Applies to video files only.")
 
+    import progress
+
+    job_id = media.get("job_id")
+    progress.stage(job_id, "frames", "run")
     frames = media_utils.extract_frames(media["path"], media["job_id"])
     if not frames:
+        progress.stage(job_id, "frames", "err", "none read")
         return media_utils.error_signal("video_face_manipulation",
                                         "AI Face Manipulation (Video)",
                                         "no frames could be read from this video")
+    progress.stage(job_id, "frames", "ok", f"{len(frames)} frames",
+                   f"Sampled at {config.VIDEO_SAMPLE_FPS:g} fps, "
+                   f"capped at {config.VIDEO_MAX_FRAMES}")
 
     # Hand the frame list back so other code (the report, cleanup) can find it.
     media["frames"] = frames
 
-    scored = _score_frames(frames)
+    scored = _score_frames(frames, job_id=job_id)
     usable = [f for f in scored if f["score"] is not None]
     if not usable:
         return media_utils.error_signal(
@@ -228,6 +253,15 @@ def analyze_video_frames(media):
     # verdict must still ship, so nothing here is allowed to raise.
     try:
         import explainer
+        # Occlusion saliency is the slowest part of a video run after frame
+        # scoring, and it happens with the frame counter already at 100%, so
+        # say what is happening instead of leaving the page apparently stuck.
+        progress.stage(job_id, "video_face_manipulation", "run",
+                       f"{len(usable)}/{len(frames)} scored",
+                       f"Building heatmaps for the {len(top_frames)} most "
+                       f"suspicious frames…")
+        progress.phase(job_id, "🔥", "Building heatmaps for the most suspicious "
+                                     "frames…")
         details["heatmaps"] = explainer.explain_frames(
             [f["path"] for f in top_frames], media["job_id"])
     except Exception as exc:

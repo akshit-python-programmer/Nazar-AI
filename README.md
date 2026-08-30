@@ -199,6 +199,35 @@ Two rules force inconclusive regardless of the average:
 `GET /job/<id>` returns a stored result. `GET /health` reports device and model
 config. Job state is in memory only, so it does not survive a restart.
 
+### Live progress
+
+`/analyze` is synchronous: one request, one finished result. That is what the
+CLI, WhatsApp and any API client want, so it has not changed. But it means the
+page has nothing to show for the twenty seconds a video takes, and the old UI
+filled that silence by animating checkpoints on **estimated timings** — an
+animation that could show a check ticking before the server had run it.
+
+The page now uses two endpoints instead:
+
+- `POST /analyze/start` — same multipart body, returns `{"job_id", "kind"}`
+  with HTTP 202 and runs the pipeline on a background thread.
+- `GET /progress/<job_id>` — the live state: every checkpoint's status, the
+  current phase line, overall percentage, video frame counts while frames are
+  being scored, and the finished result once `done` is true.
+
+Every checkpoint the page draws is a state the server actually published.
+Nothing is on a timer, so a tick means that check really finished.
+
+Frame scoring publishes a count after each batch, and the progress bar
+interpolates across the slice of the bar that stage owns, so a 46-frame clip
+visibly moves 0/46 → 32/46 → 46/46 rather than sitting still. Occlusion
+heatmap generation, which runs after the counter already reads 100%, announces
+itself too — otherwise it looks like a hang.
+
+Progress state lives in `progress.py`, in its own module because the analyzers
+publish into it and importing `pipeline` from an analyzer would be circular.
+It keeps the last 40 jobs and is dropped on restart.
+
 ## Notes on the models
 
 Model ids live in `config.py` with the label mapping each one uses. Both the
@@ -207,23 +236,84 @@ to load.
 
 ### The image model was chosen by measurement
 
-Four candidates were benchmarked on 10 known AI-generated faces and 12 real
-portraits. AUC is the chance a random AI face outranks a random real photo, so
-0.5 is a coin flip:
+Seven candidates were benchmarked. AUC is the chance a random AI image
+outranks a random real photo, so 0.5 is a coin flip:
 
-| Model | Separation | AUC | Size |
-|---|---|---|---|
-| `buildborderless/CommunityForensics-DeepfakeDet-ViT` (full frame) | **+0.842** | **0.958** | 87 MB |
-| `buildborderless/CommunityForensics-DeepfakeDet-ViT` (face crop) | +0.692 | 0.950 | 87 MB |
-| `Purnachander-Konda/deepfake-detection-swin` | +0.362 | 0.633 | 110 MB |
-| `dima806/deepfake_vs_real_image_detection` | +0.192 | 0.658 | 343 MB |
-| `prithivMLmods/deepfake-detector-model-v1` | -0.047 | 0.433 | 372 MB |
+| Model | AUC | Size |
+|---|---|---|
+| `buildborderless/CommunityForensics-DeepfakeDet-ViT` | **0.944** | 87 MB |
+| `haywoodsloan/ai-image-detector-deploy` (SwinV2-large) | 0.800 | 745 MB |
+| `Ateeqq/ai-vs-human-image-detector` (SigLIP) | 0.779 | 372 MB |
+| `dima806/deepfake_vs_real_image_detection` | 0.658 | 343 MB |
+| `Purnachander-Konda/deepfake-detection-swin` | 0.633 | 110 MB |
+| `Organika/sdxl-detector` | 0.463 | 347 MB |
+| `prithivMLmods/deepfake-detector-model-v1` | 0.433 | 372 MB |
 
 The winner is the detector from the Community Forensics work, trained across
-thousands of generators. It is also the smallest. The last model is
-**anti-correlated** - it rates real photos as more synthetic than AI faces -
-despite being the obvious pick by download count. Popularity is not accuracy;
-measure before trusting any of these.
+thousands of generators. It is also the **smallest by a factor of eight**.
+
+Two results are worth stating plainly, because both contradict the obvious
+guess:
+
+- **Bigger is not better.** The 745 MB SwinV2-large scores 0.800 against the
+  87 MB model's 0.944, and adding it to an ensemble moves nothing.
+- **Popular is not accurate.** The two bottom entries are below a coin flip.
+  `prithivMLmods` is anti-correlated (it rates real photos as more synthetic
+  than AI faces) despite being an obvious pick by download count, and
+  `Organika/sdxl-detector` fires on 47% of real photographs.
+
+Measure before trusting any of these.
+
+### Why there is an ensemble in the code but only one model in it
+
+`config.IMAGE_ENSEMBLE` is a list, members are scored independently and
+combined by `IMAGE_ENSEMBLE_STRATEGY`, and each member's own opinion is
+reported in the signal details. It currently holds one member, because that
+is what the measurement supports. On the 13 photorealistic AI images and 19
+real photos, showing the best recall reachable without flagging a single real
+photo:
+
+| Configuration | AUC | Recall at 0% false positives | Size |
+|---|---|---|---|
+| **CommunityForensics alone** | 0.984 | **92%** | 87 MB |
+| + SwinV2-large (mean) | 0.980 | 92% | 832 MB |
+| + SigLIP (mean) | 0.988 | 77% | 459 MB |
+| all four (mean) | 0.883 | 62% | 1.6 GB |
+
+Combining everything was the **worst** option. A member that fires spuriously
+is never outvoted, so `max` and `noisy_or` reached 84% and 94% recall while
+flagging 58% and 63% of real photographs — useless for a tool whose output
+someone might attach to a complaint.
+
+The machinery is kept because adding a future detector is now one entry in a
+list. The rejected models are still under `models/cand_*` if you want to
+re-run the comparison.
+
+### Scores are calibrated, not raw
+
+Raw detector output is not a calibrated probability. This model is decisive:
+real photos sit at a median of 0.0005 and AI images pile up above 0.99, so
+almost nothing lands near the 0.65 verdict line and the genuinely hard cases
+sit between 0.13 and 0.45, where the default threshold silently dropped them.
+
+| Raw threshold | Recall | False positives |
+|---|---|---|
+| 0.65 (uncalibrated) | 77% | 0% |
+| **0.20 (chosen)** | **92%** | **0%** |
+| 0.13 | 92% | 0% |
+
+0.13 gives identical recall and is deliberately **not** used: the highest
+real photo in the set scores 0.1290, so a 0.13 line clears it by 0.001 and is
+fitted to one image rather than to a real margin. 0.20 keeps the recall with
+55 times the margin.
+
+`calibrate_score()` maps the operating point onto `VERDICT_SYNTHETIC_ABOVE`
+with two straight lines. It is monotonic, so it never reorders results — it
+only moves where the decision line falls, and it keeps one set of verdict
+thresholds meaningful across every signal instead of special-casing this one.
+The blend of the full-frame and face-crop views is calibrated **after**
+blending, because calibration is piecewise linear and the operating point was
+measured that way.
 
 Two implementation details matter for this model. It has a **single sigmoid
 logit** (P(generated)), which the transformers pipeline mishandles (softmax
@@ -236,21 +326,41 @@ face swapped into an otherwise real photo.
 Re-run the benchmark yourself after adding samples to `samples/eval_ai` and
 `samples/eval_real`.
 
+### What the eval set contains, and why it is split
+
+The eval set is 54 images from Wikimedia Commons, and it is deliberately
+divided, because a first pass at harvesting "AI-generated images" filled it
+with AI *artwork* — Pop Art, Cubism, a Van Gogh pastiche, logos, a screenshot.
+Those are not what this tool is for. Nobody is deceived by an AI cubist
+painting. Scoring against them would have dragged the threshold to a number
+that was wrong for the actual job.
+
+- `samples/eval_ai/` — 31 AI images, of which **13 are photorealistic**
+  (posing as photographs, the actual threat model) and 18 are stylised art
+  that is out of scope.
+- `samples/eval_real/` — 23 real photographs, including heavily retouched
+  studio portraits that fooled the weaker models.
+
+Measured on the threat model, the detector reaches AUC **0.984**. On the
+stylised art it reaches 0.915, which is a bonus rather than a goal.
+
 ### Known accuracy, measured end to end
 
-On that same set, through the whole pipeline:
+Through the whole pipeline, verdicts rather than raw scores:
 
-- Real photos: **14 of 14 correctly cleared, zero false positives** -
-  including heavily retouched studio portraits that fooled the weaker models.
-- AI-generated faces: **80% flagged** as likely synthetic, 10% inconclusive,
-  one wrongly cleared (a diffusion-generated fashion shot the model scores
-  0.002 - a genuine blind spot, documented rather than tuned around).
+- Real photos: **20 of 23 cleared, 3 inconclusive, zero wrongly flagged.**
+- Photorealistic AI: **85% flagged**, 8% inconclusive, one wrongly cleared.
 
-A low score is still "no evidence found", not proof of authenticity: a
-generator this model has not seen can score low. That is why the verdict is
-three-way and why no single signal decides it. The audio model is equally
-strong on its own ground: three genuine human speech recordings scored 0.000
-synthetic across every window, against 1.000 for a synthetic control.
+That one miss is a diffusion-generated fashion shot scoring 0.0014. The
+rejected ensemble would have caught it (two other detectors rate it above
+0.95) — but at the cost of flagging over half of all real photographs, which
+is a far worse trade for anyone relying on this.
+
+A low score is "no evidence found", not proof of authenticity: a generator
+this model has not seen can score low. That is why the verdict is three-way
+and why no single signal decides it. The audio model is equally strong on its
+own ground: three genuine human speech recordings scored 0.000 synthetic
+across every window, against 1.000 for a synthetic control.
 
 The explainer uses **occlusion saliency** rather than Grad-CAM: a grey patch is
 slid across the image and the whole thing re-scored at each position, so
@@ -280,14 +390,24 @@ Weights live in `models/`:
 ```
 models/image_detector/        CommunityForensics ViT, the active classifier (87 MB)
 models/audio_detector/        wav2vec2 anti-spoofing (378 MB)
-models/image_detector_swin_alt/   Swin alternative, kept for comparison (110 MB)
-models/image_detector_vit_alt/    ViT alternative, kept for comparison (343 MB)
-models/rejected_siglip_unusable/  benchmarked at AUC 0.433, safe to delete (355 MB)
+
+benchmarked and rejected, kept only so the comparison can be re-run:
+models/cand_swinv2/               SwinV2-large, AUC 0.800 (745 MB)
+models/cand_ateeqq/               SigLIP, AUC 0.779 (372 MB)
+models/cand_sdxl/                 SDXL detector, AUC 0.463 (347 MB)
+models/image_detector_vit_alt/    ViT, AUC 0.658 (343 MB)
+models/image_detector_swin_alt/   Swin, AUC 0.633 (110 MB)
+models/rejected_siglip_unusable/  AUC 0.433 (355 MB)
 ```
 
 `config.resolve_model()` prefers a local folder over the HuggingFace repo id, so
-once these exist the app starts offline and never re-downloads. Delete the
-`_alt` and `rejected_` folders to reclaim ~800 MB.
+once these exist the app starts offline and never re-downloads. Only the first
+two are used at runtime: deleting every `cand_*`, `*_alt` and `rejected_*`
+folder reclaims about **2.2 GB** and changes nothing.
+
+One practical note: SwinV2-large took **7 minutes** to load from cold disk on
+this machine, against 1.4 seconds for the active model. If you re-enable it in
+`IMAGE_ENSEMBLE`, expect that on first start.
 
 Evaluation samples used for the benchmark are in `samples/eval_ai/` (known
 AI-generated faces), `samples/eval_real/` (real portraits) and

@@ -228,6 +228,18 @@ details.more summary{cursor:pointer;font-size:11.5px;color:var(--ink-3);list-sty
 details.more summary::-webkit-details-marker{display:none}
 details.more summary:hover{color:var(--accent)}
 details.more[open] summary{color:var(--ink-2);margin-bottom:9px}
+/* per-detector breakdown table */
+.dm-wrap{margin:2px 0 10px;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.dm{width:100%;border-collapse:collapse;font-size:12px}
+.dm thead th{text-align:left;padding:7px 10px;background:rgba(255,255,255,.04);
+  color:var(--ink-3);font-weight:600;letter-spacing:.02em;text-transform:uppercase;font-size:10.5px}
+.dm td{padding:7px 10px;border-top:1px solid var(--line)}
+.dm-name{font-weight:550}
+.dm-num{font-variant-numeric:tabular-nums;color:var(--ink-2);white-space:nowrap}
+.dm-tag{display:inline-block;padding:1px 7px;border-radius:999px;border:1px solid;
+  font-size:10.5px;font-weight:700;letter-spacing:.03em}
+.dm-foot{padding:6px 10px;font-size:11px;color:var(--ink-3);
+  background:rgba(255,255,255,.02);border-top:1px solid var(--line)}
 .kv{display:grid;gap:5px;font-size:12px}
 .kv div{display:flex;justify-content:space-between;gap:12px;padding:5px 8px;border-radius:8px;
   background:rgba(255,255,255,.032)}
@@ -620,7 +632,7 @@ function setStep(id, state, label, note){
 }
 
 /* ------------------------------------------------------------------ progress */
-let progress = 0, walker = null;
+let progress = 0;
 
 function setProgress(p, cls){
   progress = Math.max(progress, p);
@@ -631,39 +643,18 @@ function setProgress(p, cls){
 }
 function setPhase(icon, text){ phaseEl.innerHTML = icon + " <span>" + esc(text) + "</span>"; }
 
-/* Walk the planned checkpoints on estimated timings and hold at 92% until the
-   real response arrives.
+/* The estimated-timing walker that used to live here is gone. Every
+   checkpoint state now comes from /progress, so the page reports what the
+   engine is doing rather than what it is expected to be doing. */
 
-   Exactly one checkpoint shows the spinner at a time. A checkpoint the walker
-   has moved past goes to "awaiting result", not to a tick: the timings here are
-   estimates, and nothing may claim a check passed before the server has said
-   so. reconcile() replaces every one of these with the real outcome. */
-function startWalk(kind){
-  const list = STAGES.filter(s => planned(s, kind));
-  const total = list.reduce((a, s) => a + s.cost, 0);
-  let i = 0, done = 0, prev = null;
+/* -------------------------------------------------------------------- submit
+   Upload to /analyze/start, which returns a job id straight away and runs the
+   pipeline on a background thread, then poll /progress/<id> until it reports
+   done. Every checkpoint the page shows is a state the server actually
+   published: nothing here is on a timer. */
+let poller = null;
+function stopPoll(){ if (poller) clearTimeout(poller); poller = null; }
 
-  const tick = () => {
-    if (prev) setStep(prev.id, "wait", "awaiting result");
-    if (i >= list.length){
-      setProgress(0.92);
-      setPhase("⏳", "Waiting on the analyzers to report back…");
-      return;
-    }
-    const s = list[i];
-    setStep(s.id, "run");
-    setPhase(s.icon, "Running " + s.name.toLowerCase() + "…");
-    done += s.cost;
-    setProgress(Math.min(0.92, 0.20 + (done / total) * 0.72));
-    prev = s;
-    i++;
-    walker = setTimeout(tick, 260 + s.cost * 190);
-  };
-  tick();
-}
-function stopWalk(){ if (walker) clearTimeout(walker); walker = null; }
-
-/* -------------------------------------------------------------------- submit */
 runBtn.addEventListener("click", () => {
   if (!chosen || busy) return;
   busy = true;
@@ -684,40 +675,99 @@ runBtn.addEventListener("click", () => {
   body.append("file", chosen);
 
   const xhr = new XMLHttpRequest();
-  xhr.open("POST", "/analyze");
+  xhr.open("POST", "/analyze/start");
 
   xhr.upload.onprogress = (e) => {
     if (!e.lengthComputable) return;
-    setProgress(0.02 + (e.loaded / e.total) * 0.16);
+    setProgress(0.02 + (e.loaded / e.total) * 0.08);
     setPhase("📡", "Uploading… " + bytes(e.loaded) + " of " + bytes(e.total));
-  };
-  xhr.upload.onload = () => {
-    setProgress(0.20);
-    setStep("ingest", "run");
-    setPhase("🧪", "Upload complete. Analyzers starting — the models take longest.");
-    startWalk(chosenKind);
   };
 
   xhr.onload = () => {
-    stopWalk();
     let data = null;
     try { data = JSON.parse(xhr.responseText); } catch (_) { data = null; }
     if (!data) return fail("The server returned a response that could not be read.");
     if (xhr.status >= 400 || data.error){
-      reconcile(data, true);
       return fail(data.error || ("Analysis failed with status " + xhr.status + "."));
     }
-    reconcile(data, false);
-    render(data);
+    setPhase("🧪", "Queued. The analyzers are starting up…");
+    pollProgress(data.job_id);
   };
-  xhr.onerror = () => {
-    stopWalk();
-    fail("The request never reached the analyzer. Is the server still running?");
-  };
+  xhr.onerror = () => fail("The request never reached the analyzer. Is the server still running?");
   xhr.send(body);
 });
 
+/* Poll the live job state. Each reply is applied verbatim to the checkpoint
+   list, so a stage only shows a tick once the server has said so. */
+function pollProgress(jobId){
+  let misses = 0;
+
+  const tick = () => {
+    fetch("/progress/" + encodeURIComponent(jobId))
+      .then(r => {
+        if (r.status === 404) throw new Error("The server forgot this job. Did it restart?");
+        return r.json();
+      })
+      .then(state => {
+        misses = 0;
+        applyProgress(state);
+
+        if (!state.done){
+          poller = setTimeout(tick, 600);
+          return;
+        }
+        stopPoll();
+        if (state.error){
+          if (state.result) reconcile(state.result, true);
+          return fail(state.error);
+        }
+        const data = state.result;
+        if (!data) return fail("The run finished but returned no result.");
+        if (data.error){
+          reconcile(data, true);
+          return fail(data.error);
+        }
+        reconcile(data, false);
+        render(data);
+      })
+      .catch(err => {
+        // One dropped poll is not a failed run: the analysis keeps going on
+        // the server. Give up only after several consecutive misses.
+        if (++misses >= 5){
+          stopPoll();
+          return fail(err.message || "Lost contact with the analyzer.");
+        }
+        poller = setTimeout(tick, 1200);
+      });
+  };
+  tick();
+}
+
+/* Paint one server state onto the checkpoint list and the progress bar. */
+function applyProgress(state){
+  const stages = state.stages || {};
+  Object.keys(stages).forEach(id => {
+    const s = stages[id];
+    setStep(id, s.state, s.label, s.note);
+  });
+
+  setProgress(state.pct || 0);
+
+  let text = (state.phase && state.phase.text) || "Working…";
+  const icon = (state.phase && state.phase.icon) || "🧪";
+  // The frame counter is the one number that moves during a long video, so
+  // promote it into the phase line rather than burying it in a stage note.
+  if (state.frames && state.frames.total){
+    text += "  ·  frame " + state.frames.done + " of " + state.frames.total;
+  }
+  setPhase(icon, text);
+  pipeSub.textContent = state.elapsed
+    ? "Running · " + state.elapsed.toFixed(1) + "s elapsed"
+    : "Job in flight.";
+}
+
 function fail(msg){
+  stopPoll();
   busy = false;
   runBtn.disabled = false;
   setProgress(1, "failed");
@@ -786,8 +836,13 @@ function reconcile(data, errored){
       ? ((sig.details && sig.details.error) || sig.human_note || "This check could not run.")
       : sig.status === "not_applicable"
         ? (sig.human_note || "Does not apply to this media type.")
-        : leanWord(sig.synthetic_score) + " · score " + pct(sig.synthetic_score) +
-          " · confidence " + pct(sig.confidence);
+        : (sig.synthetic_score === null || sig.synthetic_score === undefined)
+          // Metadata and provenance normally carry no score and act on the
+          // verdict through fusion's rules instead, so say that rather than
+          // printing an empty score next to the words "no score".
+          ? "ran · no score, context only · confidence " + pct(sig.confidence)
+          : leanWord(sig.synthetic_score) + " · score " + pct(sig.synthetic_score) +
+            " · confidence " + pct(sig.confidence);
     setStep(s.id, state, label, note);
   });
 
@@ -1076,6 +1131,41 @@ function detailBlock(s){
   const d = s.details || {};
   const parts = [];
 
+  /* Per-detector breakdown: what each model in the ensemble said on its own,
+     rather than only the number they were reduced to. Rendered whenever the
+     signal reports one, so adding a detector needs no change here. */
+  if (d.per_model && typeof d.per_model === "object"){
+    const names = Object.keys(d.per_model);
+    if (names.length){
+      let rows = "";
+      names.forEach(n => {
+        const ai = d.per_model[n];
+        const has = ai !== null && ai !== undefined;
+        const real = has ? 1 - ai : null;
+        const verdict = !has ? "no score"
+                      : ai >= 0.65 ? "AI" : ai <= 0.35 ? "REAL" : "UNCERTAIN";
+        const col = !has ? "var(--ink-3)"
+                  : ai >= 0.65 ? "#ff5f78" : ai <= 0.35 ? "#35dda0" : "#ffc247";
+        rows +=
+          '<tr><td class="dm-name">' + esc(n) + '</td>' +
+          '<td class="dm-num">' + (has ? ai.toFixed(4) : "—") + '</td>' +
+          '<td class="dm-num">' + (has ? real.toFixed(4) : "—") + '</td>' +
+          '<td><span class="dm-tag" style="color:' + col + ';border-color:' + col +
+          '33;background:' + col + '14">' + verdict + '</span></td></tr>';
+      });
+      parts.push(
+        '<div class="dm-wrap"><table class="dm">' +
+        '<thead><tr><th>Detector</th><th>AI</th><th>Real</th><th>Call</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table>' +
+        (names.length > 1
+          ? '<div class="dm-foot">Combined by <b>' + esc(d.ensemble_strategy || "mean") +
+            '</b> into ' + pct(d.combined_score) + ' synthetic.</div>'
+          : '<div class="dm-foot">Scores are calibrated, so ' +
+            pct(0.65) + ' is the synthetic line.</div>') +
+        '</div>');
+    }
+  }
+
   if (Object.prototype.toString.call(d.findings) === "[object Array]" && d.findings.length){
     parts.push('<ul class="finds">' + d.findings.map(f =>
       '<li><span class="fi">' + (f.direction === "synthetic" ? "🚩" : "🟢") + '</span>' +
@@ -1102,9 +1192,12 @@ function detailBlock(s){
 
   push("model", d.model);
   if (d.face_detected !== undefined) push("face detected", d.face_detected ? "yes 🙂" : "no");
-  if (d.full_frame_score !== undefined) push("full-frame score", pct(d.full_frame_score));
-  if (d.face_crop_score !== undefined && d.face_crop_score !== null)
-    push("face-crop score", pct(d.face_crop_score));
+  // Raw, pre-calibration numbers. Labelled as raw so they are not mistaken for
+  // the calibrated score the verdict actually uses.
+  if (d.full_frame_raw !== undefined && d.full_frame_raw !== null)
+    push("full-frame (raw)", d.full_frame_raw.toFixed(4));
+  if (d.face_crop_raw !== undefined && d.face_crop_raw !== null)
+    push("face-crop (raw)", d.face_crop_raw.toFixed(4));
   if (d.combined_score !== undefined) push("blended score", pct(d.combined_score));
   push("mean error", d.mean_error);
   push("error variation", d.error_variation);

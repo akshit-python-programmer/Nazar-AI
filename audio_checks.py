@@ -90,12 +90,22 @@ def _windows(samples, rate):
     end_start = max(0, total - span)
     picks = [("start", 0), ("middle", middle_start), ("end", end_start)]
 
+    # Minimum gap between kept windows. A clip only slightly longer than one
+    # window would otherwise put "start", "middle" and "end" within a fraction
+    # of a second of each other and get the same audio scored three times.
+    min_gap = max(1, rate // 2)
+
     out = []
+    last_start = -min_gap
     for label, begin in picks:
         chunk = samples[begin:begin + span]
-        if len(chunk) > rate * 0.5:      # ignore a scrap shorter than half a second
-            out.append({"label": label, "start": round(begin / rate, 2),
-                        "samples": chunk})
+        # Ignore a scrap shorter than half a second, and skip windows that
+        # overlap an already-kept one so no audio is scored twice.
+        if len(chunk) <= rate * 0.5 or begin - last_start < min_gap:
+            continue
+        out.append({"label": label, "start": round(begin / rate, 2),
+                    "samples": chunk})
+        last_start = begin
     return out
 
 
@@ -163,6 +173,12 @@ def analyze_audio(media):
         else:
             wav = media_utils.to_wav_16k(media["path"], media["job_id"])
         media["wav"] = wav
+
+    import progress
+    progress.stage(media.get("job_id"), "wav", "ok" if wav else "err",
+                   "16 kHz mono" if wav else "decode failed",
+                   "Decoded to 16 kHz mono WAV for the anti-spoofing model."
+                   if wav else "ffmpeg could not decode an audio track.")
 
     if not wav:
         return media_utils.error_signal("voice_clone", "AI Voice Cloning",

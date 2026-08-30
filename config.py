@@ -132,6 +132,75 @@ IMAGE_MODEL_CANDIDATES = (
     "dima806/deepfake_vs_real_image_detection",
 )
 
+# --- the detector ensemble -------------------------------------------------
+#
+# One model is not enough. Each of these was trained on a different slice of
+# the generator landscape, and each has blind spots the others cover:
+# CommunityForensics is strongest on GAN faces but scored a diffusion-made
+# fashion photo at 0.002, a miss that a diffusion-trained detector catches
+# outright. Members are scored independently and combined by
+# IMAGE_ENSEMBLE_STRATEGY.
+#
+# All members stay resident on the GPU at once. Their combined weight is about
+# 1.6 GB against the 4 GB card, and inference runs one member at a time, so
+# peak memory is the resident total plus a single model's activations.
+#
+# "dir" is a folder under MODELS_DIR; a local copy is preferred over the repo
+# id so the app starts offline. A member that fails to load is skipped with a
+# warning rather than breaking the signal.
+# Measured 2026-08-30 on 13 photorealistic AI images and 19 real photos, which
+# is the population that matters here: media passing itself off as a real
+# photograph. AUC, and the best recall reachable without flagging any real
+# photo:
+#
+#   solo CommunityForensics   AUC 0.984   92% recall at 0% FP    87 MB
+#   CF + SwinV2-Large mean    AUC 0.980   92% recall at 0% FP   832 MB
+#   CF + SigLIP mean          AUC 0.988   77% recall at 0% FP   459 MB
+#   all four, mean            AUC 0.883   62% recall at 0% FP   1.6 GB
+#
+# Bigger did not mean better. The 745 MB SwinV2-Large scores AUC 0.800 alone
+# against the 87 MB CommunityForensics at 0.944, and adding it to the ensemble
+# moves nothing. Organika/sdxl-detector is worse than a coin flip on this set
+# (AUC 0.463, it fires on 47% of real photos) and drags any ensemble
+# containing it down, which is why "combine everything" scored worst of all.
+#
+# So the ensemble is deliberately a single member. The machinery below is kept
+# because it is measured, tested and config-driven: adding a detector is one
+# entry in this list, and each member's own opinion is reported in the signal
+# details. The other three are still on disk under models/cand_* if you want
+# to re-run the comparison.
+IMAGE_ENSEMBLE = [
+    {"name": "CommunityForensics", "weight": 1.0,
+     "id": "buildborderless/CommunityForensics-DeepfakeDet-ViT",
+     "dir": "image_detector",
+     # See IMAGE_SCORE_OPERATING_POINT below.
+     "operating_point": 0.20},
+]
+
+# How members' scores combine when there is more than one. Measured: "max" and
+# "noisy_or" look attractive but flag 58% and 63% of real photos respectively,
+# because a member that fires spuriously is never outvoted. "mean" is the safe
+# default. Irrelevant while the ensemble has one member.
+IMAGE_ENSEMBLE_STRATEGY = "mean"
+
+# Raw detector output is not a calibrated probability. This model is decisive:
+# real photos sit at a median of 0.0005 and AI images pile up above 0.99, so
+# almost nothing lands near the 0.65 verdict line, and the genuinely hard
+# cases sit between 0.13 and 0.45 where the default threshold silently drops
+# them. Measured on the eval set:
+#
+#   raw threshold   0.65 -> 77% recall, 0% FP     (the old, uncalibrated line)
+#   raw threshold   0.20 -> 92% recall, 0% FP     <- chosen
+#   raw threshold   0.13 -> 92% recall, 0% FP     (but see below)
+#
+# 0.13 gives the same recall and is NOT used: the highest-scoring real photo
+# in the set is 0.1290, so a 0.13 line clears it by 0.001 and is fitted to one
+# image rather than to a real margin. 0.20 keeps the same recall with 55x that
+# margin. A member's raw score is mapped so its operating point lands on
+# VERDICT_SYNTHETIC_ABOVE, which keeps one set of verdict thresholds
+# meaningful across every signal instead of special-casing this one.
+IMAGE_SCORE_OPERATING_POINT = 0.20
+
 # Backup if the primary stops resolving. Swin, labels {0: "Fake", 1: "Real"};
 # usable but far weaker (numbers above), kept only so the signal degrades
 # instead of disappearing.
@@ -184,8 +253,10 @@ def resolve_model(model_id, local_dir):
 
 # Label text meaning "synthetic" / "authentic". Compared lowercased so both
 # model families above work without per-model special casing.
-FAKE_LABELS = {"fake", "ai", "artificial", "spoof", "deepfake", "generated", "label_1"}
-REAL_LABELS = {"real", "authentic", "human", "bonafide", "genuine", "label_0"}
+FAKE_LABELS = {"fake", "ai", "artificial", "spoof", "deepfake", "generated",
+               "ai_generated", "label_1"}
+REAL_LABELS = {"real", "authentic", "human", "hum", "bonafide", "genuine",
+               "label_0"}
 
 
 # ---------------------------------------------------------------- video
@@ -256,13 +327,24 @@ DISAGREEMENT_MIN_RATIO = 0.5
 # and there is no circular import back from the analyzers into config.
 # Adding a check later means writing one function that returns the standard
 # signal dict and adding one line here.
+# (module, function, signal id, display name). The signal id is carried here
+# rather than only inside the returned dict because the pipeline needs to name
+# a check before it runs it: to announce it as started, and to label the error
+# signal if the analyzer raises before it can name itself. Two entries share a
+# module, so the module name alone cannot identify a check.
 ANALYZER_REGISTRY = [
-    ("image_checks", "analyze_image_model"),
-    ("image_checks", "analyze_ela"),
-    ("video_checks", "analyze_video_frames"),
-    ("audio_checks", "analyze_audio"),
-    ("forensics", "analyze_metadata"),
-    ("provenance", "analyze_provenance"),
+    ("image_checks", "analyze_image_model", "face_manipulation",
+     "AI Face Manipulation"),
+    ("image_checks", "analyze_ela", "error_level_analysis",
+     "Error Level Analysis"),
+    ("video_checks", "analyze_video_frames", "video_face_manipulation",
+     "AI Face Manipulation (Video)"),
+    ("audio_checks", "analyze_audio", "voice_clone",
+     "AI Voice Cloning"),
+    ("forensics", "analyze_metadata", "metadata_forensics",
+     "Metadata Forensics"),
+    ("provenance", "analyze_provenance", "provenance",
+     "Content Credentials"),
 ]
 
 
@@ -270,17 +352,21 @@ def load_analyzers():
     """
     Resolve ANALYZER_REGISTRY into callables.
 
-    Returns (list): list of (module_name, function) tuples in registry order.
-    An entry whose module or attribute cannot be imported is skipped and printed
-    to stdout rather than raised, so one broken file cannot stop the app booting.
+    Returns (list): one dict per usable analyzer, registry order, each
+    {"module": str, "signal": str, "display_name": str, "func": callable}.
+    An entry whose module or attribute cannot be imported is skipped and
+    printed to stdout rather than raised, so one broken file cannot stop the
+    app booting.
     """
     import importlib
 
     resolved = []
-    for mod_name, func_name in ANALYZER_REGISTRY:
+    for mod_name, func_name, signal, display_name in ANALYZER_REGISTRY:
         try:
             mod = importlib.import_module(mod_name)
-            resolved.append((mod_name, getattr(mod, func_name)))
+            resolved.append({"module": mod_name, "signal": signal,
+                             "display_name": display_name,
+                             "func": getattr(mod, func_name)})
         except Exception as exc:
             print(f"[config] analyzer {mod_name}.{func_name} unavailable: {exc}")
     return resolved

@@ -8,7 +8,11 @@ http://127.0.0.1:5000.
 
 import os
 
+from dotenv import load_dotenv
+
 from flask import Flask, jsonify, render_template, request
+
+load_dotenv()
 
 import config
 import media_utils
@@ -57,6 +61,69 @@ def analyze():
     if result.get("error"):
         return jsonify(result), 400
     return jsonify(result)
+
+
+@app.route("/analyze/start", methods=["POST"])
+def analyze_start():
+    """
+    Begin an analysis on a background thread and return its id immediately.
+
+    Expects multipart/form-data with a "file" field, same as /analyze.
+
+    Returns: {"job_id": str, "kind": str} with HTTP 202, or {"error": message}
+    with HTTP 400 if the file is missing or fails validation.
+
+    This exists so the page can show real progress. /analyze still runs
+    synchronously for API clients, the CLI and WhatsApp, which have no use for
+    a progress feed and would rather have the result in one call.
+    """
+    import threading
+
+    import progress
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file was attached to the request."}), 400
+
+    try:
+        saved = media_utils.save_upload(request.files["file"])
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    job_id = pipeline.new_job_id()
+    kind = media_utils.detect_media_type(saved["path"])
+    progress.start(job_id, kind)
+    progress.phase(job_id, "📥", "Upload received. Fingerprinting the file…", 0.10)
+
+    def work():
+        """Run the pipeline, recording any crash against the job."""
+        try:
+            pipeline.analyze_media(saved, job_id=job_id)
+        except Exception as exc:                     # never leave the page hanging
+            print(f"[app] job {job_id} crashed: {exc}")
+            progress.finish(job_id, error=f"The analysis crashed: {exc}")
+
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"job_id": job_id, "kind": kind}), 202
+
+
+@app.route("/progress/<job_id>")
+def job_progress(job_id):
+    """
+    Report what a running analysis is doing right now.
+
+    job_id (str): id from /analyze/start.
+
+    Returns: JSON with the stage table, the current phase line, overall
+    percentage, video frame counts while frames are being scored, and the
+    finished result once done is true. HTTP 404 for an unknown id, which
+    includes any job from before a restart.
+    """
+    import progress
+
+    state = progress.get(job_id)
+    if state is None:
+        return jsonify({"error": "No analysis is running under that id."}), 404
+    return jsonify(state)
 
 
 @app.route("/job/<job_id>")

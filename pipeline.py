@@ -87,30 +87,67 @@ def collect_media_assets(signals):
     return assets
 
 
-def run_analyzers(media):
+# How far through the run each analyzer sits, purely for the progress bar.
+# Ordered by the registry, the bar spans 0.30 to 0.90 and fusion/report finish it.
+_ANALYZER_SPAN = (0.30, 0.90)
+
+
+def run_analyzers(media, job_id=None):
     """
     Run every registered analyzer over one media file.
 
     media (dict): context from media_utils.build_media_context.
+    job_id (str|None): when given, each analyzer's start and result are
+        published to progress.py so the page can show them live.
 
     Returns (list): one signal dict per analyzer, registry order. Each call is
     wrapped by media_utils.run_safely, so an analyzer that raises yields an
     error signal and the rest still run. An empty registry yields [].
     """
+    import progress
+
     signals = []
-    for mod_name, func in config.load_analyzers():
-        signals.append(media_utils.run_safely(func, media,
-                                              signal_hint=mod_name,
-                                              name_hint=mod_name))
+    registry = config.load_analyzers()
+    lo, hi = _ANALYZER_SPAN
+
+    for index, entry in enumerate(registry):
+        signal_id = entry["signal"]
+        if job_id:
+            # Hand this analyzer its slice of the bar, so a long-running one
+            # (video frame scoring) can move the bar from inside its own loop.
+            span = (hi - lo) / max(1, len(registry))
+            band_lo = lo + index * span
+            progress.set_band(job_id, band_lo, band_lo + span)
+            progress.stage(job_id, signal_id, "run")
+            progress.phase(job_id, "🧪", f"Running {entry['display_name'].lower()}…",
+                           band_lo)
+
+        started = time.time()
+        sig = media_utils.run_safely(entry["func"], media,
+                                     signal_hint=signal_id,
+                                     name_hint=entry["display_name"])
+        # Stamp runtime so slow signals are visible in the UI and the console.
+        details = sig.setdefault("details", {})
+        details.setdefault("runtime_s", round(time.time() - started, 2))
+        print(f"[pipeline]   {signal_id}: {sig.get('status')} "
+              f"in {details['runtime_s']}s")
+
+        if job_id:
+            progress.signal_done(job_id, sig)
+        signals.append(sig)
+
     return signals
 
 
-def analyze_media(saved, make_report=True):
+def analyze_media(saved, make_report=True, job_id=None):
     """
     Full pipeline for one file: validate, analyze, fuse, report.
 
     saved (dict): output of media_utils.save_upload or save_bytes.
     make_report (bool): generate the PDF. WhatsApp needs it, quick tests may not.
+    job_id (str|None): reuse an id already registered with progress.py, so the
+        page can poll a job from the moment it is submitted. A new id is
+        minted when this is None, which is what the CLI and WhatsApp do.
 
     Returns (dict): the API response documented in the README:
     {"file": {"name","type","size","sha256","analyzed_at","job_id"},
@@ -121,7 +158,9 @@ def analyze_media(saved, make_report=True):
     verdict, so the caller can show the message without special-casing a crash.
     The result is also stored in JOBS under the job id.
     """
-    job_id = new_job_id()
+    import progress
+
+    job_id = job_id or new_job_id()
     started = time.time()
 
     media = media_utils.build_media_context(saved, job_id)
@@ -135,18 +174,37 @@ def analyze_media(saved, make_report=True):
         "job_id": job_id,
     }
 
+    # Ingest and probe both finished inside build_media_context.
+    progress.stage(job_id, "ingest", "ok",
+                   "hashed" if media["sha256"] else "failed",
+                   f"{media['size'] / 1024:.0f} KB · SHA-256 "
+                   f"{str(media['sha256'])[:12]}…")
+    identified = media["type"] != "unknown"
+    progress.stage(job_id, "probe", "ok" if identified else "err",
+                   media["type"] if identified else "unreadable",
+                   f"Identified as {media['type']}"
+                   + (f" · {media['duration']:.1f}s" if media.get("duration") else ""))
+    progress.phase(job_id, "🧭", "File fingerprinted. Starting the analyzers…", 0.28)
+
     ok, message = validate_media(media)
     if not ok:
         result = {"error": message, "file": file_block,
                   "verdict": None, "signals": [], "media": {}, "report_url": None}
         JOBS[job_id] = result
+        progress.finish(job_id, result=result, error=message)
         return result
 
     print(f"[pipeline] job {job_id} {media['type']} {media['name']} "
           f"({media['size'] / 1024:.0f} KB)")
 
-    signals = run_analyzers(media)
+    signals = run_analyzers(media, job_id=job_id)
+
+    progress.stage(job_id, "fusion", "run")
+    progress.phase(job_id, "⚖️", "Weighing the signals against each other…", 0.92)
     verdict = _fuse(signals, media)
+    progress.stage(job_id, "fusion", "ok",
+                   str((verdict or {}).get("verdict", "")).replace("_", " "),
+                   str((verdict or {}).get("headline", ""))[:200])
 
     result = {
         "file": file_block,
@@ -157,13 +215,23 @@ def analyze_media(saved, make_report=True):
     }
 
     if make_report:
+        progress.stage(job_id, "report", "run")
+        progress.phase(job_id, "📄", "Writing the PDF evidence report…", 0.96)
         result["report_url"] = _build_report(result, job_id)
+        progress.stage(job_id, "report", "ok" if result["report_url"] else "err",
+                       "ready" if result["report_url"] else "unavailable",
+                       "One page with hashes, every signal and the top overlay."
+                       if result["report_url"] else "The PDF could not be written.")
+    else:
+        progress.stage(job_id, "report", "skip", "not requested")
 
     result["file"]["total_runtime_s"] = round(time.time() - started, 2)
     print(f"[pipeline] job {job_id} done in {result['file']['total_runtime_s']}s "
           f"-> {(verdict or {}).get('verdict')}")
 
     JOBS[job_id] = result
+    progress.phase(job_id, "✅", "Analysis complete.", 1.0)
+    progress.finish(job_id, result=result)
     return result
 
 
